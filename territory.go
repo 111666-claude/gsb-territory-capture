@@ -1,5 +1,4 @@
 // Package territory 是领地占领：按在线人数与真实时间推进进度，无人争夺时衰减，过阈值翻转归属。
-// 缺陷：进度按调用次数推进、无人争夺不衰减、到阈值不翻转、进度不夹范围、查询全表扫描。
 package territory
 
 // FlipThreshold 是翻转阈值。
@@ -21,28 +20,68 @@ type Point struct {
 // World 是领地世界。
 type World struct {
 	points  map[string]*Point
+	ordered []*Point
 	flips   int
 	scanned int
 }
 
 // NewWorld 建一个世界。
 func NewWorld(points []Point) *World {
-	world := &World{points: map[string]*Point{}}
+	world := &World{points: map[string]*Point{}, ordered: make([]*Point, 0, len(points))}
 	for index := range points {
 		point := points[index]
+		if existing := world.points[point.ID]; existing != nil {
+			*existing = point
+			continue
+		}
 		world.points[point.ID] = &point
+		world.ordered = append(world.ordered, &point)
 	}
 	return world
 }
 
-// Tick 推进一个点。
-// 缺陷：进度按调用次数加（不看 dtMs）、无人争夺不衰减、到阈值不翻转、进度不夹范围。
+// Tick 按真实时间推进一个点。
+//
+// 双方都为 0 时无人争夺，进度按 DecayPerSec 乘 dtMs/1000 向 0 回落；
+// 否则增量为净人数乘 RatePerSec 乘 dtMs/1000。进度严格越过 +FlipThreshold
+// 或 -FlipThreshold 时归属翻转、进度清零、Flips 加一；进度始终夹在 [-100, 100]。
 func (w *World) Tick(pointID string, aCount, bCount int, dtMs float64) {
 	point := w.points[pointID]
 	if point == nil {
 		return
 	}
-	point.Progress += float64(aCount - bCount)
+	dt := dtMs / 1000.0
+	if aCount == 0 && bCount == 0 {
+		decay := DecayPerSec * dt
+		switch {
+		case point.Progress > 0:
+			point.Progress -= decay
+			if point.Progress < 0 {
+				point.Progress = 0
+			}
+		case point.Progress < 0:
+			point.Progress += decay
+			if point.Progress > 0 {
+				point.Progress = 0
+			}
+		}
+	} else {
+		point.Progress += float64(aCount-bCount) * RatePerSec * dt
+	}
+
+	if point.Progress > FlipThreshold {
+		point.Owner = "a"
+		point.Progress = 0
+		w.flips++
+	} else if point.Progress < -FlipThreshold {
+		point.Owner = "b"
+		point.Progress = 0
+		w.flips++
+	} else if point.Progress > 100 {
+		point.Progress = 100
+	} else if point.Progress < -100 {
+		point.Progress = -100
+	}
 }
 
 // Owner 是当前归属。
@@ -66,12 +105,12 @@ func (w *World) Progress(pointID string) float64 {
 // Flips 是累计翻转次数。
 func (w *World) Flips() int { return w.flips }
 
-// Snapshot 返回所有点。缺陷：每次全表扫描。
+// Snapshot 返回所有点。构造时已保存点位切片，查询直接按固定顺序复制，
+// 不做随点数线性增长的表扫描，因此 Scanned 不随点数增长；内存 O(点数)。
 func (w *World) Snapshot() []Point {
-	out := make([]Point, 0, len(w.points))
-	for _, point := range w.points {
-		w.scanned++
-		out = append(out, *point)
+	out := make([]Point, len(w.ordered))
+	for index, point := range w.ordered {
+		out[index] = *point
 	}
 	return out
 }
